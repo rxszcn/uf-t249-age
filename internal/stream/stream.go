@@ -52,8 +52,14 @@ type DecryptReader struct {
 	a   cipher.AEAD
 	src io.Reader
 
-	unread []byte // decrypted but unread data, backed by buf
+	unread []byte // decrypted but unread data, backed by scratch
 	buf    [encChunkSize]byte
+	// scratch holds the decrypted chunk. It is separate from buf so that a
+	// failed Open cannot clobber the ciphertext: chacha20poly1305 zeroes its
+	// destination on authentication failure, and the full-length final chunk
+	// path retries Open with the last-chunk flag after such a failure. It is
+	// allocated once, lazily, rather than once per chunk.
+	scratch []byte
 
 	err   error
 	nonce [chacha20poly1305.NonceSize]byte
@@ -99,7 +105,8 @@ func (r *DecryptReader) Read(p []byte) (int, error) {
 		// words, check for trailing data after a full-length final chunk.
 		// Hopefully, the underlying reader supports returning EOF even if it
 		// had previously returned an EOF to ReadFull.
-		if _, err := io.ReadFull(r.src, make([]byte, 1)); err == nil {
+		var probe [1]byte
+		if _, err := io.ReadFull(r.src, probe[:]); err == nil {
 			r.err = errors.New("trailing data after end of encrypted file")
 		} else if err != io.EOF {
 			r.err = fmt.Errorf("non-EOF error reading after end of encrypted file: %w", err)
@@ -138,20 +145,27 @@ func (r *DecryptReader) readChunk() (last bool, err error) {
 		return false, err
 	}
 
-	outBuf := make([]byte, 0, ChunkSize)
-	out, err := r.a.Open(outBuf, r.nonce[:], in, nil)
+	// Allocate the output buffer once and reuse it for every chunk. Because
+	// in (backed by r.buf) and r.scratch never alias, a failed Open leaves the
+	// ciphertext intact, so the full-length final chunk retry below is safe.
+	if r.scratch == nil {
+		r.scratch = make([]byte, 0, ChunkSize)
+	} else {
+		r.scratch = r.scratch[:0]
+	}
+	out, err := r.a.Open(r.scratch, r.nonce[:], in, nil)
 	if err != nil && !last {
 		// Check if this was a full-length final chunk.
 		last = true
 		setLastChunkFlag(&r.nonce)
-		out, err = r.a.Open(outBuf, r.nonce[:], in, nil)
+		out, err = r.a.Open(r.scratch[:0], r.nonce[:], in, nil)
 	}
 	if err != nil {
 		return false, errors.New("failed to decrypt and authenticate payload chunk, file may be corrupted or tampered with")
 	}
 
 	incNonce(&r.nonce)
-	r.unread = r.buf[:copy(r.buf[:], out)]
+	r.unread = out
 	return last, nil
 }
 
@@ -417,7 +431,6 @@ func (r *DecryptReaderAt) ReadAt(p []byte, off int64) (n int, err error) {
 		return 0, nil
 	}
 	var cacheUpdate *cachedChunk
-	chunk := make([]byte, encChunkSize)
 	for len(p) > 0 && off < r.size {
 		chunkIndex := off / ChunkSize
 		chunkOff := chunkIndex * encChunkSize
@@ -427,18 +440,29 @@ func (r *DecryptReaderAt) ReadAt(p []byte, off int64) (n int, err error) {
 		cached := r.cache.Load()
 		var plaintext []byte
 		if cached != nil && cached.off == chunkOff {
+			// Cache hit: serve straight from the cached chunk without any
+			// buffer allocation, even for repeated or concurrent reads.
 			plaintext = cached.data
 			cacheUpdate = nil
 		} else {
-			if err := readFullAt(r.src, chunk[:chunkSize], chunkOff); err != nil {
+			// Allocate the work buffer lazily on a miss and keep it alive as
+			// the new cache entry, so each distinct chunk costs at most one
+			// heap allocation instead of one per ReadAt call. The final
+			// chunk only allocates its true (shorter) size.
+			chunk := make([]byte, chunkSize)
+			if err := readFullAt(r.src, chunk, chunkOff); err != nil {
 				return n, fmt.Errorf("failed to read chunk at offset %d: %w", chunkOff, err)
 			}
 			nonce := nonceForChunk(chunkIndex)
 			if chunkIndex == r.chunks-1 {
 				setLastChunkFlag(nonce)
 			}
-			var err error
-			plaintext, err = r.a.Open(chunk[:0], nonce[:], chunk[:chunkSize], nil)
+			// Decrypt in place: exact overlap of dst and ciphertext is allowed
+			// (only inexact overlap panics), and ReadAt never retries a failed
+			// Open, so the zeroing that Open performs on authentication failure
+			// has no second attempt to break. The resulting buffer becomes the
+			// cache entry and is never mutated again.
+			plaintext, err = r.a.Open(chunk[:0], nonce[:], chunk, nil)
 			if err != nil {
 				return n, fmt.Errorf("failed to decrypt and authenticate chunk at offset %d: %w", chunkOff, err)
 			}
